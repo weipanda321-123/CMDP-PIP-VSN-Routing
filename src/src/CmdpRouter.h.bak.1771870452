@@ -1,0 +1,434 @@
+#ifndef CMDP_ROUTER_H
+#define CMDP_ROUTER_H
+
+#include <vector>
+#include <map>
+#include <set>
+#include <queue>
+#include <limits>
+#include <chrono>
+#include <cmath>
+#include <algorithm>
+#include <functional>
+#include <string>
+
+#include "TrustManager.h"
+#include "RLPolicyClient.h"
+#include "PIPMasker.h"
+#include "DelayEstimator.h"
+
+struct RouteResult {
+    std::vector<int> path;
+    double totalDelay = 0;
+    double totalTrustCost = 0;
+    double computeTimeMs = 0;
+    bool feasible = false;
+    bool reachable = false;
+    std::string policyMode;
+    int pipMaskedTotal = 0;
+    int pipCandidatesTotal = 0;
+    double pipDijkstraMs = 0;
+    int pipNodesExpanded = 0;
+};
+
+/**
+ * GraphSnapshot: local topology for routing.
+ * FIX (BUG-11): edges are deduplicated via set check.
+ */
+struct GraphSnapshot {
+    std::map<int, std::vector<int>> adjacency;
+    std::map<int, std::pair<double,double>> positions;
+    std::set<int> nodeSet;
+
+    void addEdge(int u, int v) {
+        // Deduplicate (BUG-11 fix)
+        auto& adj = adjacency[u];
+        if (std::find(adj.begin(), adj.end(), v) == adj.end()) {
+            adj.push_back(v);
+        }
+        nodeSet.insert(u);
+        nodeSet.insert(v);
+    }
+
+    void setPosition(int node, double x, double y) {
+        positions[node] = {x, y};
+        nodeSet.insert(node);
+    }
+
+    double getDistance(int u, int v) const {
+        auto itu = positions.find(u);
+        auto itv = positions.find(v);
+        if (itu == positions.end() || itv == positions.end()) return 100.0;
+        double dx = itu->second.first - itv->second.first;
+        double dy = itu->second.second - itv->second.second;
+        return std::sqrt(dx*dx + dy*dy);
+    }
+
+    std::vector<int> getNeighbors(int node) const {
+        auto it = adjacency.find(node);
+        if (it != adjacency.end()) return it->second;
+        return {};
+    }
+};
+
+/**
+ * CmdpRouter: trust-constrained min-delay routing (OJCOMS Section III)
+ *
+ * Modes:
+ *   LagrangianGreedy - greedy with lambda*r_j penalty (Eq.20)
+ *   ExactBaseline    - label-setting RCSPP
+ *   RLPolicy         - placeholder for trained PPO policy
+ */
+class CmdpRouter {
+public:
+    CmdpRouter()
+        : lambda_(1.0), etaLambda_(0.005), usePIP_(true),
+          useOracle_(true), useGNN_(false),
+          policyMode_("LagrangianGreedy"), maxHops_(20) {}
+
+    void initialize(const std::string& mode, bool usePIP, bool useOracle,
+                    bool useGNN, double lambda, int maxHops) {
+        policyMode_ = mode;
+        usePIP_ = usePIP;
+        useOracle_ = useOracle;
+        useGNN_ = useGNN;
+        lambda_ = lambda;
+        maxHops_ = maxHops;
+        if (mode == "RLPolicy") {
+            rlClient_.initialize("127.0.0.1", 5556);
+        }
+    }
+
+    void setLambda(double l) { lambda_ = l; }
+    double getLambda() const { return lambda_; }
+    void setEtaLambda(double e) { etaLambda_ = e; }
+
+    /**
+     * Dual ascent update for lambda (BUG-9 fix):
+     * lambda <- max(0, lambda + eta * (totalTrustCost - budget))
+     */
+    void updateLambda(double totalTrustCost, double budget) {
+        double violation = totalTrustCost - budget;
+        lambda_ = std::max(0.0, lambda_ + etaLambda_ * violation);
+    }
+
+    RouteResult solveRoute(int src, int dst, double budgetB,
+                           const GraphSnapshot& graph,
+                           const TrustManager& trustMgr,
+                           const DelayEstimator& delayEst) {
+        if (policyMode_ == "LagrangianGreedy") {
+            return solveLagrangianGreedy(src, dst, budgetB, graph, trustMgr, delayEst);
+        } else if (policyMode_ == "ExactBaseline") {
+            return solveExactLabelSetting(src, dst, budgetB, graph, trustMgr, delayEst);
+        } else if (policyMode_ == "RLPolicy") {
+            return solveRLPolicy(src, dst, budgetB, graph, trustMgr, delayEst);
+        }
+        return solveLagrangianGreedy(src, dst, budgetB, graph, trustMgr, delayEst);
+    }
+
+private:
+    /** LagrangianGreedy: argmin(c_ij + lambda * r_j) per step (Eq.20) */
+    RouteResult solveLagrangianGreedy(int src, int dst, double budgetB,
+                                       const GraphSnapshot& graph,
+                                       const TrustManager& trustMgr,
+                                       const DelayEstimator& delayEst) {
+        RouteResult result;
+        result.policyMode = "LagrangianGreedy";
+        auto tStart = std::chrono::high_resolution_clock::now();
+
+        PIPMasker pip;
+        PIPStats pipInitStats;
+        if (usePIP_) {
+            pipInitStats = pip.computeTrustToGo(dst, graph.adjacency, trustMgr);
+            result.pipDijkstraMs = pipInitStats.dijkstraTimeMs;
+            result.pipNodesExpanded = pipInitStats.nodesExpanded;
+        }
+
+        std::vector<int> path;
+        path.push_back(src);
+        std::set<int> visited;
+        visited.insert(src);
+
+        double remainingBudget = budgetB;
+        double totalDelay = 0.0;
+        double totalTrustCost = 0.0;
+        int current = src;
+
+        for (int step = 0; step < maxHops_ && current != dst; step++) {
+            std::vector<int> neighbors = graph.getNeighbors(current);
+
+            std::vector<int> candidates;
+            for (int j : neighbors) {
+                if (visited.find(j) == visited.end())
+                    candidates.push_back(j);
+            }
+            if (candidates.empty()) break;
+
+            std::vector<int> feasible;
+            PIPStats stepPipStats;
+            if (usePIP_) {
+                feasible = pip.getFeasibleActions(current, remainingBudget,
+                                                  candidates, trustMgr, stepPipStats);
+                result.pipMaskedTotal += stepPipStats.maskedActions;
+                result.pipCandidatesTotal += stepPipStats.totalCandidates;
+            } else {
+                feasible = candidates;
+            }
+            if (feasible.empty()) break;
+
+            int bestJ = -1;
+            double bestScore = std::numeric_limits<double>::infinity();
+            for (int j : feasible) {
+                double dist = graph.getDistance(current, j);
+                double cij = delayEst.getDelayEstimate(current, j, dist, 0.0, useOracle_);
+                if (useGNN_) {
+                    double gnnDelay = delayEst.getGNNDelay(current, j);
+                    if (gnnDelay > 0) cij = gnnDelay;
+                }
+                double rj = (j == dst) ? 0.0 : trustMgr.computeTrustCost(j);
+                double score = cij + lambda_ * rj;
+                if (score < bestScore) { bestScore = score; bestJ = j; }
+            }
+            if (bestJ < 0) break;
+
+            double dist = graph.getDistance(current, bestJ);
+            double cij = delayEst.getDelayEstimate(current, bestJ, dist, 0.0, useOracle_);
+            if (useGNN_) {
+                double gnnDelay = delayEst.getGNNDelay(current, bestJ);
+                if (gnnDelay > 0) cij = gnnDelay;
+            }
+            double rj = (bestJ == dst) ? 0.0 : trustMgr.computeTrustCost(bestJ);
+
+            totalDelay += cij;
+            totalTrustCost += rj;
+            remainingBudget -= rj;
+            path.push_back(bestJ);
+            visited.insert(bestJ);
+            current = bestJ;
+        }
+
+        auto tEnd = std::chrono::high_resolution_clock::now();
+        result.computeTimeMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+        result.path = path;
+        result.totalDelay = totalDelay;
+        result.totalTrustCost = totalTrustCost;
+        result.reachable = (current == dst);
+        result.feasible = result.reachable && (totalTrustCost <= budgetB + 1e-9);
+        return result;
+    }
+
+    /** ExactBaseline: label-setting RCSPP */
+    RouteResult solveExactLabelSetting(int src, int dst, double budgetB,
+                                        const GraphSnapshot& graph,
+                                        const TrustManager& trustMgr,
+                                        const DelayEstimator& delayEst) {
+        RouteResult result;
+        result.policyMode = "ExactBaseline";
+        auto tStart = std::chrono::high_resolution_clock::now();
+
+        struct Label {
+            double delay;
+            double trustCost;
+            int node;
+            std::vector<int> path;
+            bool operator>(const Label& o) const { return delay > o.delay; }
+        };
+
+        std::map<int, std::vector<std::pair<double,double>>> paretoFront;
+        auto isDominated = [](const std::vector<std::pair<double,double>>& front,
+                              double d, double r) -> bool {
+            for (const auto& f : front) {
+                if (f.first <= d && f.second <= r) return true;
+            }
+            return false;
+        };
+
+        std::priority_queue<Label, std::vector<Label>, std::greater<Label>> pq;
+        Label init;
+        init.delay = 0; init.trustCost = 0; init.node = src; init.path = {src};
+        pq.push(init);
+
+        Label bestResult;
+        bestResult.delay = std::numeric_limits<double>::infinity();
+        bool found = false;
+        int maxLabels = 100000;
+        int labelCount = 0;
+
+        while (!pq.empty() && labelCount < maxLabels) {
+            Label cur = pq.top(); pq.pop();
+            labelCount++;
+
+            if (cur.node == dst) {
+                if (cur.delay < bestResult.delay) { bestResult = cur; found = true; }
+                continue;
+            }
+            if (isDominated(paretoFront[cur.node], cur.delay, cur.trustCost)) continue;
+            paretoFront[cur.node].push_back({cur.delay, cur.trustCost});
+            if (found && cur.delay >= bestResult.delay) continue;
+
+            for (int j : graph.getNeighbors(cur.node)) {
+                bool inPath = false;
+                for (int p : cur.path) { if (p == j) { inPath = true; break; } }
+                if (inPath) continue;
+
+                double dist = graph.getDistance(cur.node, j);
+                double cij = delayEst.getDelayEstimate(cur.node, j, dist, 0.0, useOracle_);
+                if (useGNN_) { double gnnDelay = delayEst.getGNNDelay(cur.node, j); if (gnnDelay > 0) cij = gnnDelay; }
+                double rj = (j == dst) ? 0.0 : trustMgr.computeTrustCost(j);
+                double newDelay = cur.delay + cij;
+                double newTrust = cur.trustCost + rj;
+                if (newTrust > budgetB + 1e-9) continue;
+                if (isDominated(paretoFront[j], newDelay, newTrust)) continue;
+
+                Label next;
+                next.delay = newDelay; next.trustCost = newTrust;
+                next.node = j; next.path = cur.path;
+                next.path.push_back(j);
+                pq.push(next);
+            }
+        }
+
+        auto tEnd = std::chrono::high_resolution_clock::now();
+        result.computeTimeMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+
+        if (found) {
+            result.path = bestResult.path;
+            result.totalDelay = bestResult.delay;
+            result.totalTrustCost = bestResult.trustCost;
+            result.reachable = true;
+            result.feasible = (bestResult.trustCost <= budgetB + 1e-9);
+        }
+        return result;
+    }
+
+    std::string policyMode_;
+    /** RLPolicy: query PPO inference server for next-hop decisions (Fig.2) */
+    RouteResult solveRLPolicy(int src, int dst, double budgetB,
+                               const GraphSnapshot& graph,
+                               const TrustManager& trustMgr,
+                               const DelayEstimator& delayEst) {
+        RouteResult result;
+        result.policyMode = "RLPolicy";
+        auto tStart = std::chrono::high_resolution_clock::now();
+        double tcpTimeMs = 0.0;
+
+        PIPMasker pip;
+        PIPStats pipInitStats;
+        if (usePIP_) {
+            pipInitStats = pip.computeTrustToGo(dst, graph.adjacency, trustMgr);
+            result.pipDijkstraMs = pipInitStats.dijkstraTimeMs;
+            result.pipNodesExpanded = pipInitStats.nodesExpanded;
+        }
+
+        std::vector<int> path;
+        path.push_back(src);
+        std::set<int> visited;
+        visited.insert(src);
+
+        double remainingBudget = budgetB;
+        double totalDelay = 0.0;
+        double totalTrustCost = 0.0;
+        int current = src;
+
+        for (int step = 0; step < maxHops_ && current != dst; step++) {
+            std::vector<int> neighbors = graph.getNeighbors(current);
+
+            std::vector<int> candidates;
+            for (int j : neighbors) {
+                if (visited.find(j) == visited.end())
+                    candidates.push_back(j);
+            }
+            if (candidates.empty()) break;
+
+            // PIP feasibility check
+            std::vector<int> feasible;
+            PIPStats stepPipStats;
+            if (usePIP_) {
+                feasible = pip.getFeasibleActions(current, remainingBudget,
+                                                  candidates, trustMgr, stepPipStats);
+                result.pipMaskedTotal += stepPipStats.maskedActions;
+                result.pipCandidatesTotal += stepPipStats.totalCandidates;
+            } else {
+                feasible = candidates;
+            }
+            if (feasible.empty()) break;
+
+            int bestJ = -1;
+
+            // Try PPO server
+            if (rlClient_.isEnabled()) {
+                std::vector<double> trustCosts, delays, hStarVals;
+                for (int j : feasible) {
+                    double rj = (j == dst) ? 0.0 : trustMgr.computeTrustCost(j);
+                    trustCosts.push_back(rj);
+                    double dist = graph.getDistance(current, j);
+                    double cij = delayEst.getDelayEstimate(current, j, dist, 0.0, useOracle_);
+                    if (useGNN_) {
+                        double gnnDelay = delayEst.getGNNDelay(current, j);
+                        if (gnnDelay > 0) cij = gnnDelay;
+                    }
+                    delays.push_back(cij);
+                    hStarVals.push_back(pip.getHStar(j));
+                }
+                double confidence = 0;
+                auto _tcp1 = std::chrono::high_resolution_clock::now();
+                bestJ = rlClient_.queryNextHop(current, dst, remainingBudget, step,
+                                                feasible, trustCosts, delays, hStarVals,
+                                                budgetB, confidence);
+                tcpTimeMs += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - _tcp1).count();
+            }
+
+            // Fallback to LagrangianGreedy if PPO server fails
+            if (bestJ < 0) {
+                double bestScore = std::numeric_limits<double>::infinity();
+                for (int j : feasible) {
+                    double dist = graph.getDistance(current, j);
+                    double cij = delayEst.getDelayEstimate(current, j, dist, 0.0, useOracle_);
+                    if (useGNN_) {
+                        double gnnDelay = delayEst.getGNNDelay(current, j);
+                        if (gnnDelay > 0) cij = gnnDelay;
+                    }
+                    double rj = (j == dst) ? 0.0 : trustMgr.computeTrustCost(j);
+                    double score = cij + lambda_ * rj;
+                    if (score < bestScore) { bestScore = score; bestJ = j; }
+                }
+            }
+            if (bestJ < 0) break;
+
+            double dist = graph.getDistance(current, bestJ);
+            double cij = delayEst.getDelayEstimate(current, bestJ, dist, 0.0, useOracle_);
+            if (useGNN_) {
+                double gnnDelay = delayEst.getGNNDelay(current, bestJ);
+                if (gnnDelay > 0) cij = gnnDelay;
+            }
+            double rj = (bestJ == dst) ? 0.0 : trustMgr.computeTrustCost(bestJ);
+
+            totalDelay += cij;
+            totalTrustCost += rj;
+            remainingBudget -= rj;
+            path.push_back(bestJ);
+            visited.insert(bestJ);
+            current = bestJ;
+        }
+
+        auto tEnd = std::chrono::high_resolution_clock::now();
+        double wallTimeMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+        result.computeTimeMs = wallTimeMs - tcpTimeMs;
+        result.path = path;
+        result.totalDelay = totalDelay;
+        result.totalTrustCost = totalTrustCost;
+        result.reachable = (current == dst);
+        result.feasible = result.reachable && (totalTrustCost <= budgetB + 1e-9);
+        return result;
+    }
+
+    double lambda_;
+    double etaLambda_;
+    bool usePIP_;
+    bool useOracle_;
+    bool useGNN_;
+    int maxHops_;
+    RLPolicyClient rlClient_;
+};
+
+#endif

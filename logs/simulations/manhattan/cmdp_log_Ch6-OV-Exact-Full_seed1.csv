@@ -1,0 +1,1 @@
+configName,simTime,src,dst,policyMode,reachable,feasible,totalDelay,totalTrustCost,budget,hops,computeTimeMs,pipMasked,pipCandidates,pipDijkstraMs,pipNodesExpanded,lambda

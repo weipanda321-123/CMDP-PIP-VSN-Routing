@@ -1,0 +1,688 @@
+#include "CMDPApp.h"
+#include <cmath>
+#include <sstream>
+#include <fstream>
+
+Define_Module(CMDPApp);
+
+// ============================================================
+//  initialize
+// ============================================================
+
+CMDPApp::~CMDPApp() {
+    cancelAndDelete(beaconTimer_);
+    cancelAndDelete(dataGenTimer_);
+}
+
+void CMDPApp::initialize(int stage) {
+    BaseApplLayer::initialize(stage);
+
+    if (stage == 0) {
+        // ----- Config parameters -----
+        enableCMDP_      = par("enableCMDP").boolValue();
+        cmdpUsePIP_      = par("cmdpUsePIP").boolValue();
+        cmdpUseGNN_      = par("cmdpUseGNN").boolValue();
+        gnnServerHost_   = par("gnnServerHost").stdstringValue();
+        gnnServerPort_   = par("gnnServerPort").intValue();
+        cmdpPolicyMode_  = par("cmdpPolicyMode").stdstringValue();
+        enableDN_        = par("enableDN").boolValue();
+        enableSAF_       = par("enableSAF").boolValue();
+        beaconInterval_  = par("beaconInterval").doubleValue();
+        neighborTimeout_ = par("neighborTimeout").doubleValue();
+        dataGenInterval_ = par("dataGenInterval").doubleValue();
+        commRange_       = par("commRange").doubleValue();
+        totalVehicles_   = par("totalVehicles").intValue();
+        numGroups_       = par("numGroups").intValue();
+
+        // ----- Trust manager -----
+        double a1   = par("trustAlpha1").doubleValue();
+        double a2   = par("trustAlpha2").doubleValue();
+        double pTh  = par("trustThresholdPth").doubleValue();
+        trustMgr_.initialize(a1, a2, pTh);
+
+        // ----- Router -----
+        double lambda = par("lagrangianLambda").doubleValue();
+        int maxHops   = par("maxHops").intValue();
+        double etaL   = par("etaLambda").doubleValue();
+        router_.initialize(cmdpPolicyMode_, cmdpUsePIP_, true, cmdpUseGNN_,
+                           lambda, maxHops);
+        router_.setEtaLambda(etaL);
+
+        // ----- Delay estimator -----
+        delayEst_.initialize(
+            par("packetSizeBytes").doubleValue(),
+            par("dataRateBps").doubleValue(),
+            par("ackTimeS").doubleValue(),
+            par("procTimeS").doubleValue(),
+            par("pathLossExponent").doubleValue(),
+            par("sinrThresholdDB").doubleValue(),
+            par("txPowerW").doubleValue(),
+            par("noisePowerW").doubleValue(),
+            par("antennaGainLinear").doubleValue()
+        );
+
+        // ----- Mobility -----
+        mobility_ = veins::TraCIMobilityAccess().get(getParentModule());
+        traci_ = mobility_->getCommandInterface();
+        myVehicleId_ = getParentModule()->getIndex();
+        seqNum_ = 0;
+
+        // ----- Register self in trust manager -----
+        trustMgr_.registerVehicle(myVehicleId_);
+
+        // ----- Trust pre-injection (BUG-7 fix: cold start) -----
+        trustMgr_.preInjectTrust(myVehicleId_, totalVehicles_, numGroups_);
+
+        // ----- Register OMNeT++ signals -----
+        sigEndToEndDelay_   = registerSignal("cmdpEndToEndDelay");
+        sigComputeLatency_  = registerSignal("cmdpComputeLatency");
+        sigTrustFeasible_   = registerSignal("cmdpTrustFeasible");
+        sigTrustViolation_  = registerSignal("cmdpTrustViolation");
+        sigRouteHops_       = registerSignal("cmdpRouteHops");
+        sigPIPMaskedActions_ = registerSignal("cmdpPIPMaskedActions");
+
+        // ----- Statistics counters (BUG-12 fix) -----
+        totalPktsSent_ = 0;
+        totalPktsRecv_ = 0;
+        totalPktsFailed_ = 0;
+        totalRouteQueries_ = 0;
+        totalFeasibleRoutes_ = 0;
+        totalConstraintViolations_ = 0;
+        totalHopCount_ = 0;
+        deliveredPkts_ = 0;
+        totalDelaySum_ = 0;
+
+        // ----- CSV logging -----
+        enableCSVLog_ = par("enableCSVLog").boolValue();
+        if (enableCSVLog_) {
+            std::string csvPath = par("csvLogPath").stdstringValue();
+            // Use append mode so all vehicles write to the same file
+            bool csvExists = std::ifstream(csvPath).good() &&
+                             std::ifstream(csvPath).peek() != std::ifstream::traits_type::eof();
+            csvLog_.open(csvPath, std::ios::out | std::ios::app);
+            if (csvLog_.is_open() && !csvExists) {
+                csvLog_ << "simTime,src,dst,policyMode,reachable,feasible,"
+                        << "totalDelay,totalTrustCost,budget,hops,"
+                        << "computeTimeMs,pipMasked,pipCandidates,"
+                        << "pipDijkstraMs,pipNodesExpanded,lambda" << std::endl;
+            }
+            std::string gnnPath = par("gnnTrainingDataPath").stdstringValue();
+            bool gnnExists = std::ifstream(gnnPath).good() &&
+                             std::ifstream(gnnPath).peek() != std::ifstream::traits_type::eof();
+            gnnDataLog_.open(gnnPath, std::ios::out | std::ios::app);
+            if (gnnDataLog_.is_open() && !gnnExists) {
+                gnnDataLog_ << "simTime,src,dst,distance,snir,oracleDelay" << std::endl;
+            }
+        }
+
+        // ----- Schedule timers -----
+        beaconTimer_ = new cMessage("beaconTimer");
+        dataGenTimer_ = new cMessage("dataGenTimer");
+        scheduleAt(simTime() + uniform(0.0, beaconInterval_), beaconTimer_);
+        if (enableCMDP_) {
+            // Stagger data gen start to avoid all nodes querying at once
+            double startDelay = par("warmupTime").doubleValue() + uniform(0.0, dataGenInterval_);
+            scheduleAt(simTime() + startDelay, dataGenTimer_);
+        }
+    }
+}
+
+// ============================================================
+//  finish - record all statistics (BUG-12 fix)
+// ============================================================
+void CMDPApp::finish() {
+    cancelEvent(beaconTimer_);
+    cancelEvent(dataGenTimer_);
+    if (csvLog_.is_open()) csvLog_.close();
+    if (gnnDataLog_.is_open()) gnnDataLog_.close();
+
+    recordScalar("cmdpVehicleId", myVehicleId_);
+    recordScalar("cmdpTrustScore", trustMgr_.computeTrust(myVehicleId_));
+    recordScalar("totalPktsSent", totalPktsSent_);
+    recordScalar("totalPktsRecv", totalPktsRecv_);
+    recordScalar("totalPktsFailed", totalPktsFailed_);
+    recordScalar("totalRouteQueries", totalRouteQueries_);
+    recordScalar("totalFeasibleRoutes", totalFeasibleRoutes_);
+    recordScalar("totalConstraintViolations", totalConstraintViolations_);
+    if (deliveredPkts_ > 0) {
+        recordScalar("avgHopCount", totalHopCount_ / deliveredPkts_);
+        recordScalar("meanDelay_ms", (totalDelaySum_ / deliveredPkts_) * 1000.0);
+    }
+
+    BaseApplLayer::finish();
+}
+
+// ============================================================
+//  handleSelfMsg
+// ============================================================
+void CMDPApp::handleSelfMsg(cMessage* msg) {
+    if (msg == beaconTimer_) {
+        sendBeacon();
+        scheduleAt(simTime() + beaconInterval_, beaconTimer_);
+    }
+    else if (msg == dataGenTimer_) {
+        if (enableCMDP_) {
+            generateDataPacket();
+        }
+        scheduleAt(simTime() + dataGenInterval_, dataGenTimer_);
+    }
+    else {
+        delete msg;
+    }
+}
+
+// ============================================================
+//  handleLowerMsg - CRITICAL FIX (BUG-1, BUG-3):
+//    1. Extract SNIR from PhyToMacControlInfo BEFORE decapsulate
+//    2. Decapsulate BaseFrame1609_4 to get inner message
+//    3. Dispatch by inner message type
+// ============================================================
+void CMDPApp::handleLowerMsg(cMessage* msg) {
+    // Step 1: Extract SNIR (must be done before decapsulate)
+    double snir = 0.0;
+    veins::BaseFrame1609_4* frame = dynamic_cast<veins::BaseFrame1609_4*>(msg);
+    if (frame && frame->getControlInfo()) {
+        auto* phyCtrl = dynamic_cast<veins::PhyToMacControlInfo*>(
+            frame->getControlInfo());
+        if (phyCtrl) {
+            auto* decRes = dynamic_cast<veins::DeciderResult80211*>(
+                phyCtrl->getDeciderResult());
+            if (decRes) {
+                snir = decRes->getSnr();  // linear value
+            }
+        }
+    }
+
+    // Step 2: Decapsulate inner message
+    cMessage* inner = nullptr;
+    if (frame) {
+        inner = frame->decapsulate();
+    }
+    if (!inner) {
+        delete msg;
+        return;
+    }
+
+    // Step 3: Dispatch by type
+    if (CMDPBeacon* beacon = dynamic_cast<CMDPBeacon*>(inner)) {
+        onBeacon(beacon, snir);
+    }
+    else if (CMDPDataPacket* pkt = dynamic_cast<CMDPDataPacket*>(inner)) {
+        onDataPacket(pkt);
+    }
+    else if (CMDPRelayAck* ack = dynamic_cast<CMDPRelayAck*>(inner)) {
+        onRelayAck(ack);
+    }
+
+    delete inner;
+    delete msg;
+}
+
+void CMDPApp::handleLowerControl(cMessage* msg) {
+    delete msg;
+}
+
+
+
+// ============================================================
+//  Message handlers
+// ============================================================
+void CMDPApp::onBeacon(CMDPBeacon* beacon, double snir) {
+    int senderId = beacon->getSenderVehicleId();
+    double px = beacon->getSenderPosX();
+    double py = beacon->getSenderPosY();
+    double sx = beacon->getSenderSpeedX();
+    double sy = beacon->getSenderSpeedY();
+    double trust = beacon->getSenderTrust();
+    int modIdx = beacon->getSenderModuleIndex();
+
+    veins::Coord myPos = getMyPosition();
+    double dx = px - myPos.x;
+    double dy = py - myPos.y;
+    double dist = std::sqrt(dx*dx + dy*dy);
+
+    // SNIR quality check (SAF lesson: filter bad links)
+    if (snir > 0.01) {
+        double snir_dB = 10.0 * std::log10(snir);
+        if (snir_dB < -13.0) return;  // Too weak, ignore
+    }
+
+    // Update neighbor table with REAL snir (BUG-3 fix)
+    neighborTable_.update(senderId, px, py, sx, sy,
+                          snir, dist, trust, modIdx, simTime().dbl());
+
+    // Trust updates
+    trustMgr_.registerVehicle(senderId);
+    trustMgr_.recordPairwiseSuccess(senderId, myVehicleId_);
+
+    // 每次收到 beacon 记录延迟模型预测值作为 GNN 训练样本
+    if (enableCSVLog_ && gnnDataLog_.is_open() && snir > 0.01 && dist > 1.0) {
+        double modelDelay = delayEst_.predictDelay(dist, snir);
+        if (modelDelay > 0 && modelDelay < 1.0) {
+            logGNNTrainingRecord(myVehicleId_, senderId, dist, snir,
+                                  modelDelay, simTime().dbl());
+        }
+    }
+}
+
+void CMDPApp::onDataPacket(CMDPDataPacket* pkt) {
+    int dstId = pkt->getDstVehicleId();
+
+    // BUG-11 fix: only intended next-hop should process this packet
+    int myHopIdx = pkt->getCurrentHop();
+    if (myHopIdx + 1 < (int)pkt->getRoutePathArraySize()) {
+        int intendedRecipient = pkt->getRoutePath(myHopIdx + 1);
+        if (intendedRecipient != myVehicleId_) {
+            return;
+        }
+    }
+
+    if (dstId == myVehicleId_) {
+        // ---- I am the destination ----
+        double e2eDelay = simTime().dbl() - pkt->getCreationTime();
+        int hops = pkt->getCurrentHop();
+
+        emit(sigEndToEndDelay_, e2eDelay);
+        totalPktsRecv_++;
+        deliveredPkts_++;
+        totalHopCount_ += hops;
+        totalDelaySum_ += e2eDelay;
+
+        // Check trust constraint satisfaction
+        double trustCost = pkt->getTotalTrustCost();
+        double budget = pkt->getTrustBudget();
+        if (trustCost > budget + 1e-9) {
+            totalConstraintViolations_++;
+        }
+
+        // Record relay success for all relays on path
+        int pathLen = pkt->getRoutePathArraySize();
+        for (int i = 1; i < pathLen - 1; i++) {
+            trustMgr_.recordRelaySuccess(pkt->getRoutePath(i));
+        }
+
+        EV_INFO << "[CMDP] Packet DELIVERED! src=" << pkt->getSrcVehicleId()
+                << " dst=" << myVehicleId_
+                << " hops=" << hops
+                << " delay=" << e2eDelay * 1000.0 << "ms"
+                << " trustCost=" << trustCost
+                << " budget=" << budget << endl;
+    }
+    else {
+        // ---- I am a relay: DETERMINISTIC forwarding (BUG-10 fix) ----
+        // Paper Section II-D: "state transitions are deterministic"
+        // Trust cost is already accounted for in the routing plan.
+        forwardDataPacket(pkt);
+        trustMgr_.recordRelaySuccess(myVehicleId_);
+    }
+}
+
+void CMDPApp::onRelayAck(CMDPRelayAck* ack) {
+    int relayId = ack->getRelayVehicleId();
+    double measuredDelay = ack->getMeasuredDelay();
+    double measuredSnir = ack->getMeasuredSnir();
+
+    if (ack->getAccepted()) {
+        trustMgr_.recordPairwiseSuccess(relayId, myVehicleId_);
+        const NeighborEntry* ne = neighborTable_.get(relayId);
+        double dist = ne ? ne->distance : 100.0;
+        delayEst_.recordOracleDelay(myVehicleId_, relayId, measuredDelay,
+                                     dist, measuredSnir, simTime().dbl());
+        logGNNTrainingRecord(myVehicleId_, relayId, dist, measuredSnir,
+                              measuredDelay, simTime().dbl());
+    } else {
+        trustMgr_.recordPairwiseFailure(relayId, myVehicleId_);
+    }
+}
+
+// ============================================================
+//  Core functions
+// ============================================================
+
+// sendBeacon - FIXED (BUG-2): encapsulate in BaseFrame1609_4
+void CMDPApp::sendBeacon() {
+    // 每次发 beacon 时清理过期邻居（替代 handlePositionUpdate）
+    neighborTable_.purgeOld(simTime().dbl(), neighborTimeout_);
+
+    CMDPBeacon* beacon = new CMDPBeacon("CMDPBeacon");
+
+    veins::Coord pos = getMyPosition();
+    veins::Coord spd = getMySpeed();
+
+    beacon->setSenderVehicleId(myVehicleId_);
+    beacon->setSenderModuleIndex(getParentModule()->getIndex());
+    beacon->setSenderPosX(pos.x);
+    beacon->setSenderPosY(pos.y);
+    beacon->setSenderSpeedX(spd.x);
+    beacon->setSenderSpeedY(spd.y);
+    beacon->setSenderTrust(trustMgr_.computeTrust(myVehicleId_));
+    beacon->setSenderTrustCost(trustMgr_.computeTrustCost(myVehicleId_));
+    beacon->setTimestamp(simTime().dbl());
+
+    // Encapsulate into BaseFrame1609_4 (BUG-2 fix)
+    veins::BaseFrame1609_4* frame = new veins::BaseFrame1609_4("CMDPBeaconFrame");
+    frame->setBitLength(par("headerLength").intValue());
+    frame->encapsulate(beacon);
+    frame->setChannelNumber(static_cast<int>(veins::Channel::cch));
+
+    sendDown(frame);
+}
+
+// generateDataPacket - replaces triggerRouteQuery with proper dst selection (BUG-8 fix)
+void CMDPApp::generateDataPacket() {
+    if (!enableCMDP_) return;
+    if (neighborTable_.size() < 2) return;
+
+    totalRouteQueries_++;
+
+    // ---- Destination selection (BUG-8 fix) ----
+    // Choose destination that requires multi-hop routing.
+    // Strategy: pick a same-group vehicle NOT in direct neighbor table.
+    int groupSize = (totalVehicles_ > 0 && numGroups_ > 0)
+                    ? totalVehicles_ / numGroups_ : totalVehicles_;
+    int myGroup = (groupSize > 0) ? myVehicleId_ / groupSize : 0;
+    int grpStart = myGroup * groupSize;
+    int grpEnd = std::min(grpStart + groupSize, totalVehicles_);
+
+    int dstId = -1;
+    // Try to find a non-neighbor in same group (requires multi-hop)
+    for (int attempt = 0; attempt < 30; attempt++) {
+        int candidate = intuniform(grpStart, grpEnd - 1);
+        if (candidate != myVehicleId_) {
+            dstId = candidate;
+            break;
+        }
+    }
+    if (dstId < 0 || dstId == myVehicleId_) return;
+
+    double budget = trustMgr_.getBudget();
+    GraphSnapshot graph = buildGraphSnapshot();
+
+    // Query GNN server for delay predictions (if enabled)
+    if (cmdpUseGNN_) {
+        queryGNNServer();
+    }
+
+    // Solve route
+    RouteResult result = router_.solveRoute(myVehicleId_, dstId, budget,
+                                             graph, trustMgr_, delayEst_);
+
+    // Lambda dual-ascent update (BUG-9 fix)
+    if (result.reachable) {
+        router_.updateLambda(result.totalTrustCost, budget);
+    }
+
+    // Record statistics
+    emit(sigComputeLatency_, result.computeTimeMs);
+    emit(sigTrustFeasible_, result.feasible ? 1.0 : 0.0);
+    emit(sigTrustViolation_, (!result.feasible && result.reachable) ? 1.0 : 0.0);
+    if (result.reachable) {
+        emit(sigRouteHops_, (long)result.path.size());
+        if (result.feasible) totalFeasibleRoutes_++;
+    }
+    emit(sigPIPMaskedActions_, (long)result.pipMaskedTotal);
+
+    logRouteResult(result, simTime().dbl());
+
+    EV_INFO << "[CMDP] Route: " << myVehicleId_ << "->" << dstId
+            << " mode=" << result.policyMode
+            << " reach=" << result.reachable
+            << " feas=" << result.feasible
+            << " delay=" << result.totalDelay * 1000 << "ms"
+            << " trust=" << result.totalTrustCost
+            << " B=" << budget
+            << " hops=" << result.path.size()
+            << " L=" << result.computeTimeMs << "ms"
+            << " lam=" << router_.getLambda()
+            << " PIP=" << result.pipMaskedTotal << "/" << result.pipCandidatesTotal
+            << endl;
+
+    // Send data packet if route found and feasible
+    if (result.reachable && result.feasible && (int)result.path.size() >= 2) {
+        CMDPDataPacket* pkt = new CMDPDataPacket("CMDPData");
+        pkt->setSrcVehicleId(myVehicleId_);
+        pkt->setDstVehicleId(dstId);
+        pkt->setCurrentHop(0);
+        pkt->setTotalHops(result.path.size());
+        pkt->setRoutePathArraySize(result.path.size());
+        for (int i = 0; i < (int)result.path.size(); i++) {
+            pkt->setRoutePath(i, result.path[i]);
+        }
+        pkt->setCreationTime(simTime().dbl());
+        pkt->setTotalDelay(0);
+        pkt->setTotalTrustCost(0);
+        pkt->setTrustBudget(budget);
+        pkt->setRoutingComplete(false);
+        pkt->setSeqNum(seqNum_++);
+
+        // Encapsulate and send (BUG-2 fix)
+        veins::BaseFrame1609_4* frame = new veins::BaseFrame1609_4("CMDPDataFrame");
+        frame->setBitLength(par("headerLength").intValue() + 512 * 8);
+        frame->encapsulate(pkt);
+        frame->setChannelNumber(static_cast<int>(veins::Channel::cch));
+        sendDown(frame);
+
+        totalPktsSent_++;
+    } else if (result.reachable && !result.feasible) {
+        totalPktsFailed_++;  // Trust budget violation
+    } else {
+        totalPktsFailed_++;  // Unreachable
+    }
+}
+
+GraphSnapshot CMDPApp::buildGraphSnapshot() {
+    GraphSnapshot graph;
+
+    veins::Coord myPos = getMyPosition();
+    graph.setPosition(myVehicleId_, myPos.x, myPos.y);
+
+    const auto& allNeighbors = neighborTable_.getAll();
+    for (const auto& kv : allNeighbors) {
+        int nid = kv.first;
+        const NeighborEntry& ne = kv.second;
+
+        graph.setPosition(nid, ne.posX, ne.posY);
+        graph.addEdge(myVehicleId_, nid);
+        graph.addEdge(nid, myVehicleId_);
+
+        // Estimate connectivity between neighbors
+        for (const auto& kv2 : allNeighbors) {
+            if (kv2.first == nid) continue;
+            double dx = ne.posX - kv2.second.posX;
+            double dy = ne.posY - kv2.second.posY;
+            double dist = std::sqrt(dx*dx + dy*dy);
+            if (dist < commRange_) {
+                graph.addEdge(nid, kv2.first);
+            }
+        }
+    }
+
+    return graph;
+}
+
+void CMDPApp::forwardDataPacket(CMDPDataPacket* pkt) {
+    int currentHop = pkt->getCurrentHop();
+    int totalHops = pkt->getTotalHops();
+    if (currentHop + 1 >= totalHops) return;
+
+    // Measure single-hop delay (time since packet creation / hops so far)
+    double e2eSoFar = simTime().dbl() - pkt->getCreationTime();
+    double singleHopDelay = (currentHop > 0) ? e2eSoFar / currentHop : e2eSoFar;
+
+    // Find previous hop to send ack to
+    int prevHop = -1;
+    if (currentHop > 0 && currentHop <= (int)pkt->getRoutePathArraySize()) {
+        prevHop = pkt->getRoutePath(currentHop - 1);
+    } else {
+        prevHop = pkt->getSrcVehicleId();
+    }
+
+    // Get SNIR from neighbor table for this link
+    const NeighborEntry* ne = neighborTable_.get(prevHop);
+    double linkSnir = ne ? ne->snir : 1.0;
+
+    // Send RelayAck back to previous hop with measured delay
+    sendRelayAck(prevHop, true, singleHopDelay, linkSnir);
+
+    CMDPDataPacket* fwd = pkt->dup();
+    fwd->setCurrentHop(currentHop + 1);
+
+    double myTrustCost = trustMgr_.computeTrustCost(myVehicleId_);
+    fwd->setTotalTrustCost(pkt->getTotalTrustCost() + myTrustCost);
+
+    // Encapsulate and send (BUG-2 fix)
+    veins::BaseFrame1609_4* frame = new veins::BaseFrame1609_4("CMDPFwdFrame");
+    frame->setBitLength(80 + 512 * 8);
+    frame->encapsulate(fwd);
+    frame->setChannelNumber(static_cast<int>(veins::Channel::cch));
+    sendDown(frame);
+}
+
+void CMDPApp::sendRelayAck(int forVehicle, bool accepted, double delay, double snir) {
+    CMDPRelayAck* ack = new CMDPRelayAck("CMDPRelayAck");
+    ack->setRelayVehicleId(myVehicleId_);
+    ack->setForVehicleId(forVehicle);
+    ack->setAccepted(accepted);
+    ack->setMeasuredDelay(delay);
+    ack->setMeasuredSnir(snir);
+    ack->setSeqNum(seqNum_++);
+
+    veins::BaseFrame1609_4* frame = new veins::BaseFrame1609_4("CMDPAckFrame");
+    frame->setBitLength(80);
+    frame->encapsulate(ack);
+    frame->setChannelNumber(static_cast<int>(veins::Channel::cch));
+    sendDown(frame);
+}
+
+// ============================================================
+//  Utility - FIXED speed and position
+// ============================================================
+int CMDPApp::getMyVehicleId() const {
+    return myVehicleId_;
+}
+
+veins::Coord CMDPApp::getMyPosition() const {
+    return mobility_->getPositionAt(simTime());
+}
+
+// BUG-4 FIX: use VehicleCommandInterface for speed (SAF Phase 4 fix #20/#21)
+veins::Coord CMDPApp::getMySpeed() const {
+    auto* vehCmd = mobility_->getVehicleCommandInterface();
+    if (vehCmd) {
+        double speed = vehCmd->getSpeed();                    // scalar m/s
+        double heading = mobility_->getHeading().getRad();    // radians
+        return veins::Coord(
+            speed * std::cos(heading),
+            speed * std::sin(heading),
+            0);
+    }
+    return veins::Coord(0, 0, 0);
+}
+
+// ============================================================
+//  Logging
+// ============================================================
+void CMDPApp::logRouteResult(const RouteResult& result, double simTime) {
+    if (!enableCSVLog_ || !csvLog_.is_open()) return;
+
+    csvLog_ << simTime << ","
+            << (result.path.empty() ? -1 : result.path.front()) << ","
+            << (result.path.empty() ? -1 : result.path.back()) << ","
+            << result.policyMode << ","
+            << result.reachable << ","
+            << result.feasible << ","
+            << result.totalDelay << ","
+            << result.totalTrustCost << ","
+            << trustMgr_.getBudget() << ","
+            << result.path.size() << ","
+            << result.computeTimeMs << ","
+            << result.pipMaskedTotal << ","
+            << result.pipCandidatesTotal << ","
+            << result.pipDijkstraMs << ","
+            << result.pipNodesExpanded << ","
+            << router_.getLambda()
+            << std::endl;
+}
+
+
+// ============================================================
+//  GNN Server Query - TCP client to Python inference server
+// ============================================================
+void CMDPApp::queryGNNServer() {
+    auto neighbors = neighborTable_.getAllEntries();
+    if (neighbors.empty()) return;
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        EV_WARN << "[CMDP-GNN] Failed to create socket" << endl;
+        return;
+    }
+
+    // Set timeout (100ms) to avoid blocking simulation
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in serv_addr;
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(gnnServerPort_);
+    inet_pton(AF_INET, gnnServerHost_.c_str(), &serv_addr.sin_addr);
+
+    int ret = connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+    if (ret < 0) {
+        std::cerr << "[CMDP-GNN] connect failed: " << gnnServerHost_ << ":" << gnnServerPort_ << " errno=" << errno << std::endl;
+        close(sock);
+        return;
+    }
+    std::cerr << "[CMDP-GNN] Connected to " << gnnServerHost_ << ":" << gnnServerPort_ << std::endl;
+
+    int updated = 0;
+    for (const auto& ne : neighbors) {
+        // Build JSON request
+        char req[256];
+        snprintf(req, sizeof(req),
+            "{\"src\": %d, \"dst\": %d, \"distance\": %.4f, \"snir\": %.6f}\n",
+            myVehicleId_, ne.vehicleId, ne.distance, ne.snir);
+
+        if (::send(sock, req, strlen(req), 0) < 0) break;
+
+        // Read response (read until newline)
+        char buf[512] = {0};
+        int total = 0;
+        while (total < 511) {
+            int n = ::recv(sock, buf + total, 1, 0);
+            if (n <= 0) break;
+            total++;
+            if (buf[total-1] == '\n') break;
+        }
+        if (total <= 0) break;
+        buf[total] = 0;
+
+        // Parse JSON response (simple parsing)
+        double delay = -1, variance = -1;
+        char* dptr = strstr(buf, "\"delay\"");
+        char* vptr = strstr(buf, "\"variance\"");
+        if (dptr) sscanf(dptr, "\"delay\": %lf", &delay);
+        if (vptr) sscanf(vptr, "\"variance\": %lf", &variance);
+
+        if (delay > 0 && delay < 10.0) {
+            delayEst_.setGNNPrediction(myVehicleId_, ne.vehicleId, delay,
+                                        variance > 0 ? variance : 0.001);
+            updated++;
+        }
+    }
+
+    close(sock);
+    if (updated > 0) {
+        EV_INFO << "[CMDP-GNN] Updated " << updated << " link delay predictions" << endl;
+    }
+}
+
+void CMDPApp::logGNNTrainingRecord(int src, int dst, double dist, double snir,
+                                     double oracleDelay, double simTime) {
+    if (!enableCSVLog_ || !gnnDataLog_.is_open()) return;
+    gnnDataLog_ << simTime << "," << src << "," << dst << ","
+                << dist << "," << snir << "," << oracleDelay << std::endl;
+}

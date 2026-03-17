@@ -1,0 +1,425 @@
+#include "SocialGraphManager.h"
+#include <cmath>
+#include <queue>
+#include <sstream>
+#include <algorithm>
+#include <numeric>
+#include <random>
+#include <cassert>
+#include <limits>
+
+namespace saf {
+
+SocialGraphManager::SocialGraphManager() {}
+
+void SocialGraphManager::setParams(double theta, double psi,
+                                    double contactWindow,
+                                    double contactThreshDuration,
+                                    int contactThreshFreq,
+                                    int profileLength, int profileSeed) {
+    theta_ = theta;
+    psi_   = psi;
+    contactWindow_ = contactWindow;
+    contactThreshDuration_ = contactThreshDuration;
+    contactThreshFreq_ = contactThreshFreq;
+    profileLength_ = profileLength;
+    profileSeed_ = profileSeed;
+}
+
+// ================================================================
+//  Node registration & profile generation
+// ================================================================
+void SocialGraphManager::registerNode(int nodeId) {
+    if (nodeData_.count(nodeId)) return;
+    NodeSocialData nd;
+    nodeData_[nodeId] = nd;
+    generateProfile(nodeId);
+}
+
+void SocialGraphManager::setNodeGroup(int nodeId, int groupId) {
+    if (nodeData_.count(nodeId))
+        nodeData_[nodeId].groupId = groupId;
+    // Regenerate profile with group coherence
+    generateProfile(nodeId);
+}
+
+void SocialGraphManager::generateProfile(int nodeId) {
+    int groupId = nodeData_[nodeId].groupId;
+    auto& prof = nodeData_[nodeId].socialProfile;
+    prof.resize(profileLength_, 0);
+
+    // FIX: one-hot deterministic profile per group
+    // Same group → identical profile → cosine SHP = 1.0 (from t=0)
+    // Different group → orthogonal profile → cosine SHP = 0.0
+    // groupId: 0=alpha, 1=beta, 2=gamma, 3=fleet_E, 4=fleet_F, 5=selfish, 6=random
+    if (groupId >= 0 && groupId < profileLength_) {
+        // Pure one-hot: only bit [groupId] is set
+        prof[groupId] = 1;
+    } else {
+        // Unknown/overflow group: all zeros → SHP=0 with everyone
+        // (safe fallback, no spurious affinity)
+    }
+}
+
+
+void SocialGraphManager::recordContact(int myId, int otherId, double simTime) {
+    registerNode(myId);
+    registerNode(otherId);
+    int k1 = edgeKey(myId, otherId);
+    int k2 = edgeVal(myId, otherId);
+    auto& cr = contactRecords_[k1][k2];
+
+    if (!cr.currentlyInContact) {
+        cr.currentlyInContact = true;
+        cr.contactStartTime = simTime;
+        cr.contactCount++;
+    }
+    cr.lastContactTime = simTime;
+}
+
+void SocialGraphManager::recordContactEnd(int myId, int otherId, double simTime) {
+    int k1 = edgeKey(myId, otherId);
+    int k2 = edgeVal(myId, otherId);
+    auto it1 = contactRecords_.find(k1);
+    if (it1 == contactRecords_.end()) return;
+    auto it2 = it1->second.find(k2);
+    if (it2 == it1->second.end()) return;
+    auto& cr = it2->second;
+    if (cr.currentlyInContact) {
+        cr.totalContactDuration += (simTime - cr.contactStartTime);
+        cr.currentlyInContact = false;
+    }
+}
+
+// ================================================================
+//  Periodic update (called every deltaT_soc ≈ 5s)
+// ================================================================
+void SocialGraphManager::periodicUpdate(double simTime) {
+    // 1) Update edge weights from contact records
+    for (auto& kv1 : contactRecords_) {
+        for (auto& kv2 : kv1.second) {
+            auto& cr = kv2.second;
+            // Update edge weight = contact count (used by getSocialMetric CF)
+            int a = kv1.first, b = kv2.first;
+            edges_[a][b].weight = cr.contactCount;
+            edges_[b][a].weight = cr.contactCount;
+        }
+    }
+    // Centrality and clustering computation REMOVED
+    // getSocialMetric now uses only CF (edge weight) + SHP (homophily)
+    // Brandes O(N^2) was the performance bottleneck
+}
+
+void SocialGraphManager::pruneOldContacts(double simTime) {
+    double cutoff = simTime - contactWindow_;
+    std::vector<std::pair<int,int>> toRemove;
+    for (auto& kv1 : contactRecords_) {
+        for (auto& kv2 : kv1.second) {
+            if (kv2.second.lastContactTime < cutoff) {
+                toRemove.push_back({kv1.first, kv2.first});
+            }
+        }
+    }
+    for (auto& p : toRemove) {
+        contactRecords_[p.first].erase(p.second);
+        if (contactRecords_[p.first].empty())
+            contactRecords_.erase(p.first);
+    }
+}
+
+void SocialGraphManager::rebuildEdges() {
+    edges_.clear();
+    for (auto& kv1 : contactRecords_) {
+        for (auto& kv2 : kv1.second) {
+            int a = kv1.first;
+            int b = kv2.first;
+            auto& cr = kv2.second;
+            if (cr.totalContactDuration >= contactThreshDuration_ ||
+                cr.contactCount >= contactThreshFreq_) {
+                double w = cr.totalContactDuration / contactWindow_;  // normalized
+                w = std::min(w, 1.0);
+                edges_[a][b].weight = w; edges_[a][b].lastUpdate = 0;
+                edges_[b][a].weight = w; edges_[b][a].lastUpdate = 0;
+            }
+        }
+    }
+    // Update degree info
+    for (auto& kv : nodeData_) {
+        int id = kv.first;
+        auto it = edges_.find(id);
+        if (it != edges_.end()) {
+            kv.second.degree = (int)it->second.size();
+            double wd = 0;
+            for (auto& e : it->second) wd += e.second.weight;
+            kv.second.weightedDegree = wd;
+        } else {
+            kv.second.degree = 0;
+            kv.second.weightedDegree = 0;
+        }
+    }
+}
+
+// ================================================================
+//  Strict centrality: BFS-based betweenness & closeness
+// ================================================================
+void SocialGraphManager::computeCentralityStrict() {
+    auto nodes = getNodeIds();
+    int n = (int)nodes.size();
+    if (n < 2) return;
+
+    // Initialize betweenness to 0
+    for (auto& kv : nodeData_) {
+        kv.second.betweenness = 0.0;
+        kv.second.closeness = 0.0;
+    }
+
+    // Brandes' algorithm for betweenness centrality
+    for (int s : nodes) {
+        // BFS from s
+        std::map<int, int> dist;
+        std::map<int, double> sigma;
+        std::map<int, double> delta;
+        std::map<int, std::vector<int>> pred;
+
+        for (int v : nodes) {
+            dist[v] = -1;
+            sigma[v] = 0.0;
+            delta[v] = 0.0;
+        }
+        dist[s] = 0;
+        sigma[s] = 1.0;
+
+        std::queue<int> Q;
+        std::vector<int> S;  // stack in order of discovery
+        Q.push(s);
+
+        while (!Q.empty()) {
+            int v = Q.front(); Q.pop();
+            S.push_back(v);
+            auto edgeIt = edges_.find(v);
+            if (edgeIt == edges_.end()) continue;
+            for (auto& e : edgeIt->second) {
+                int w = e.first;
+                if (dist[w] < 0) {
+                    dist[w] = dist[v] + 1;
+                    Q.push(w);
+                }
+                if (dist[w] == dist[v] + 1) {
+                    sigma[w] += sigma[v];
+                    pred[w].push_back(v);
+                }
+            }
+        }
+
+        // Accumulate betweenness
+        for (int i = (int)S.size() - 1; i >= 0; --i) {
+            int w = S[i];
+            for (int v : pred[w]) {
+                delta[v] += (sigma[v] / sigma[w]) * (1.0 + delta[w]);
+            }
+            if (w != s) {
+                nodeData_[w].betweenness += delta[w];
+            }
+        }
+
+        // Closeness: sum of distances from s
+        double sumDist = 0;
+        int reachable = 0;
+        for (int v : nodes) {
+            if (v != s && dist[v] > 0) {
+                sumDist += dist[v];
+                reachable++;
+            }
+        }
+        if (sumDist > 0) {
+            nodeData_[s].closeness = (double)reachable / sumDist;
+        }
+    }
+
+    // Normalize betweenness: divide by (n-1)(n-2)/2
+    double norm = (n > 2) ? (double)(n - 1) * (n - 2) / 2.0 : 1.0;
+    double maxBt = 0;
+    double maxCc = 0;
+    for (auto& kv : nodeData_) {
+        kv.second.betweenness /= norm;
+        maxBt = std::max(maxBt, kv.second.betweenness);
+        maxCc = std::max(maxCc, kv.second.closeness);
+    }
+    // Normalize to [0,1]
+    if (maxBt > 0) {
+        for (auto& kv : nodeData_) kv.second.betweenness /= maxBt;
+    }
+    if (maxCc > 0) {
+        for (auto& kv : nodeData_) kv.second.closeness /= maxCc;
+    }
+
+    // Compute CSC
+    for (auto& kv : nodeData_) {
+        kv.second.socialCentrality =
+            theta_ * kv.second.betweenness + (1.0 - theta_) * kv.second.closeness;
+    }
+}
+
+// ================================================================
+//  Light centrality: degree-based approximation
+// ================================================================
+void SocialGraphManager::computeCentralityLight() {
+    // Approximate betweenness by normalized weighted degree
+    // Approximate closeness by inverse of avg neighbor distance in hops (= 1/1 for direct neighbors)
+    double maxWD = 0;
+    int maxDeg = 0;
+    for (auto& kv : nodeData_) {
+        maxWD  = std::max(maxWD, kv.second.weightedDegree);
+        maxDeg = std::max(maxDeg, kv.second.degree);
+    }
+
+    for (auto& kv : nodeData_) {
+        double normBt = (maxWD > 0) ? kv.second.weightedDegree / maxWD : 0.0;
+        double normCc = (maxDeg > 0) ? (double)kv.second.degree / maxDeg : 0.0;
+        kv.second.betweenness = normBt;
+        kv.second.closeness   = normCc;
+        kv.second.socialCentrality =
+            theta_ * normBt + (1.0 - theta_) * normCc;
+    }
+}
+
+// ================================================================
+//  Clustering coefficients (both modes)
+// ================================================================
+void SocialGraphManager::computeClusteringCoeffs() {
+    for (auto& kv : nodeData_) {
+        int id = kv.first;
+        auto it = edges_.find(id);
+        if (it == edges_.end() || it->second.size() < 2) {
+            kv.second.clusteringCoeff = 0.0;
+            continue;
+        }
+        // Count edges among neighbors
+        std::vector<int> neighbors;
+        for (auto& e : it->second) neighbors.push_back(e.first);
+        int k = (int)neighbors.size();
+        int edgesAmongNeighbors = 0;
+        for (int i = 0; i < k; ++i) {
+            for (int j = i + 1; j < k; ++j) {
+                auto ni = edges_.find(neighbors[i]);
+                if (ni != edges_.end() && ni->second.count(neighbors[j])) {
+                    edgesAmongNeighbors++;
+                }
+            }
+        }
+        double maxEdges = k * (k - 1) / 2.0;
+        kv.second.clusteringCoeff = (maxEdges > 0) ?
+            edgesAmongNeighbors / maxEdges : 0.0;
+    }
+}
+
+// ================================================================
+//  Homophily: cosine similarity of binary profile vectors
+// ================================================================
+double SocialGraphManager::cosineSimBinary(const std::vector<uint8_t>& a,
+                                            const std::vector<uint8_t>& b) const {
+    if (a.size() != b.size() || a.empty()) return 0.0;
+    int dot = 0, na = 0, nb = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        dot += a[i] * b[i];
+        na  += a[i] * a[i];
+        nb  += b[i] * b[i];
+    }
+    if (na == 0 || nb == 0) return 0.0;
+    return (double)dot / (std::sqrt((double)na) * std::sqrt((double)nb));
+}
+
+double SocialGraphManager::getHomophily(int nodeI, int nodeJ) const {
+    auto itI = nodeData_.find(nodeI);
+    auto itJ = nodeData_.find(nodeJ);
+    if (itI == nodeData_.end() || itJ == nodeData_.end()) return 0.0;
+    return cosineSimBinary(itI->second.socialProfile, itJ->second.socialProfile);
+}
+
+// ================================================================
+//  Social Metric SM(i,j) = CSC(i) * CSS(i,j)
+//  where CSS(i,j) = psi * C_i + (1-psi) * SHP(i,j)
+// ================================================================
+double SocialGraphManager::getSocialMetric(int nodeI, int nodeJ) const {
+    auto itI = nodeData_.find(nodeI);
+    if (itI == nodeData_.end()) return 0.0;
+    auto itJ = nodeData_.find(nodeJ);
+    if (itJ == nodeData_.end()) return 0.0;
+
+    // Factor 1: Contact Frequency
+    // Primary: runtime contact count (builds up during simulation)
+    double cf_runtime = 0.0;
+    auto edgeIt = edges_.find(nodeI);
+    if (edgeIt != edges_.end()) {
+        auto jt = edgeIt->second.find(nodeJ);
+        if (jt != edgeIt->second.end()) {
+            const double N_sat = 10.0;
+            cf_runtime = std::min(1.0, jt->second.weight / N_sat);
+        }
+    }
+
+    // Prior CF: based on group membership
+    // Rationale: in real commuting, same-group vehicles meet every day
+    // before the 50s simulation window. The prior restores this history.
+    // groupId: 0=alpha,1=beta,2=gamma (commuters), 3=fleet_E,4=fleet_F,
+    //          5=selfish, 6=random
+    double cf_prior = 0.0;
+    int gi = itI->second.groupId;
+    int gj = itJ->second.groupId;
+    if (gi >= 0 && gj >= 0) {
+        if (gi == gj) {
+            // Same group: daily commute, strong history
+            cf_prior = 0.8;
+        } else if (gi <= 2 && gj <= 2) {
+            // Both commuters but different corridors: occasional overlap
+            cf_prior = 0.2;
+        } else if ((gi == 3 || gi == 4) && (gj == 3 || gj == 4)) {
+            // Both fleet: coordinated routes, strong history
+            cf_prior = 0.9;
+        }
+        // selfish(5) and random(6): cf_prior=0 (no reliable history)
+    }
+
+    // Take max: runtime beats prior once enough contacts accumulate
+    double cf = std::max(cf_prior, cf_runtime);
+
+    // Factor 2: Homophily SHP(i,j) = cosine similarity of one-hot profiles
+    double shp = getHomophily(nodeI, nodeJ);
+
+    // Weighted sum (theta=0.9, psi=0.1 per TNSE paper)
+    const double alpha = 0.3;   // weight for CF
+    double sm = alpha * cf + (1.0 - alpha) * shp;
+    return std::max(0.0, std::min(1.0, sm));
+}
+
+
+double SocialGraphManager::getSocialCentrality(int nodeId) const {
+    auto it = nodeData_.find(nodeId);
+    if (it == nodeData_.end()) return 0.0;
+    return it->second.socialCentrality;
+}
+
+std::vector<int> SocialGraphManager::getNodeIds() const {
+    std::vector<int> ids;
+    ids.reserve(nodeData_.size());
+    for (auto& kv : nodeData_) ids.push_back(kv.first);
+    return ids;
+}
+
+std::string SocialGraphManager::dumpGraph() const {
+    std::ostringstream os;
+    os << "SocialGraph: " << nodeData_.size() << " nodes, edges:\n";
+    std::set<std::pair<int,int>> printed;
+    for (auto& kv1 : edges_) {
+        for (auto& kv2 : kv1.second) {
+            int a = std::min(kv1.first, kv2.first);
+            int b = std::max(kv1.first, kv2.first);
+            if (printed.count({a,b})) continue;
+            printed.insert({a,b});
+            os << "  " << a << " -- " << b << " w=" << kv2.second.weight << "\n";
+        }
+    }
+    return os.str();
+}
+
+} // namespace saf

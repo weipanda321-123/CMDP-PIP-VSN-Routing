@@ -1,0 +1,128 @@
+#ifndef CMDP_APP_H
+#define CMDP_APP_H
+
+#include <fstream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <memory>
+
+#include "veins/base/modules/BaseApplLayer.h"
+#include "veins/modules/mobility/traci/TraCIMobility.h"
+#include "veins/modules/mobility/traci/TraCICommandInterface.h"
+// Veins 5.2: generated message headers use _m.h suffix
+#include "veins/modules/messages/BaseFrame1609_4_m.h"
+// SNIR extraction (SAF lesson: must include these)
+#include "veins/base/phyLayer/PhyToMacControlInfo.h"
+#include "veins/modules/phy/DeciderResult80211.h"
+// Channel enum (cch, sch1, etc.)
+#include "veins/modules/utility/Consts80211p.h"
+
+#include "CMDPPacket_m.h"
+#include "TrustManager.h"
+#include "PIPMasker.h"
+#include "CmdpRouter.h"
+#include "DelayEstimator.h"
+#include "NeighborTable.h"
+
+using namespace omnetpp;
+
+class CMDPApp : public veins::BaseApplLayer {
+public:
+    virtual ~CMDPApp();
+    void initialize(int stage) override;
+    void finish() override;
+
+protected:
+    void handleSelfMsg(cMessage* msg) override;
+    void handleLowerMsg(cMessage* msg) override;
+    void handleLowerControl(cMessage* msg) override;
+
+    // Message handlers (onBeacon takes snir parameter)
+    void onBeacon(CMDPBeacon* beacon, double snir);
+    void onDataPacket(CMDPDataPacket* pkt);
+    void onRelayAck(CMDPRelayAck* ack);
+
+    // Core functions
+    void sendBeacon();
+    void generateDataPacket();
+    GraphSnapshot buildGraphSnapshot();
+    void forwardDataPacket(CMDPDataPacket* pkt);
+    void sendRelayAck(int forVehicle, bool accepted, double delay, double snir);
+
+    // Utility
+    int getMyVehicleId() const;
+    veins::Coord getMyPosition() const;
+    veins::Coord getMySpeed() const;  // FIXED: uses VehicleCommandInterface
+
+    // Logging
+    void logRouteResult(const RouteResult& result, double simTime);
+    void logGNNTrainingRecord(int src, int dst, double dist, double snir,
+                               double oracleDelay, double simTime);
+    void queryGNNServer();
+
+private:
+    // Config
+    bool enableCMDP_;
+    bool cmdpUsePIP_;
+    bool cmdpUseGNN_;
+    std::string gnnServerHost_;
+    int gnnServerPort_;
+    std::string cmdpPolicyMode_;
+    bool enableDN_;
+    bool enableSAF_;
+    double beaconInterval_;
+    double neighborTimeout_;
+    double dataGenInterval_;
+    double commRange_;
+    GraphSnapshot cachedGraph_;
+    double lastGraphTime_ = -1.0;
+    int totalVehicles_;
+    int numGroups_;
+
+    // Core components
+    TrustManager trustMgr_;
+    CmdpRouter router_;
+    DelayEstimator delayEst_;
+    NeighborTable neighborTable_;
+
+    // Mobility
+    veins::TraCIMobility* mobility_;
+    veins::TraCICommandInterface* traci_;
+
+    // Timers
+    cMessage* beaconTimer_ = nullptr;
+    cMessage* dataGenTimer_ = nullptr;
+
+    // State
+    int myVehicleId_;
+    int seqNum_;
+
+    // Logging
+    bool enableCSVLog_;
+    std::ofstream csvLog_;
+    std::ofstream deliveryLog_;
+    std::ofstream gnnDataLog_;
+
+    // Statistics counters (BUG-12 fix)
+    int totalPktsSent_;
+    int totalPktsRecv_;
+    int totalPktsFailed_;
+    int totalRouteQueries_;
+    int totalFeasibleRoutes_;
+    int totalConstraintViolations_;
+    double totalHopCount_;
+    int deliveredPkts_;
+    double totalDelaySum_;
+
+    // OMNeT++ signals
+    simsignal_t sigEndToEndDelay_;
+    simsignal_t sigComputeLatency_;
+    simsignal_t sigTrustFeasible_;
+    simsignal_t sigTrustViolation_;
+    simsignal_t sigRouteHops_;
+    simsignal_t sigPIPMaskedActions_;
+};
+
+#endif

@@ -1,0 +1,4 @@
+#include "CMDPPacket_m.h"
+Register_Class(CMDPBeacon)
+Register_Class(CMDPDataPacket)
+Register_Class(CMDPRelayAck)
